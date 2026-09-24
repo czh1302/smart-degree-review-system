@@ -118,5 +118,39 @@ class FiveRuleDetectorTests(unittest.TestCase):
         self.assertEqual([f['token'] for f in result['findings']], ['99'])
         self.assertEqual(result['findings'][0]['page'], 2)
 
+
+    def test_numbered_abstract_contributions_do_not_start_body_before_toc(self):
+        copied = ['连续复制的正文第一行说明研究场景与总体方法具有明确意义',
+                  '连续复制的正文第二行说明系统实现过程和关键技术的关系',
+                  '连续复制的正文第三行说明实验结论和性能分析得到结果']
+        lines = [line(1, '摘要', 40)]
+        lines += [line(1, text, 80 + i * 16) for i, text in enumerate(copied)]
+        lines += [line(1, '1. 本文首先提出一种实验方法。', 150),
+                  line(1, '关键词：系统', 200), line(2, '目录', 40),
+                  line(2, '第1章 绪论........1', 80),
+                  line(2, '1.1 研究背景........1', 100),
+                  line(2, '1.2 研究方法........2', 120),
+                  line(3, '第1章 绪论', 40)]
+        lines += [line(3, text, 90 + i * 16) for i, text in enumerate(copied)]
+        result = detect_lines(lines, [6])['6']
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(result['findings']), 1)
+
+
+    def test_toc_continuation_page_and_back_matter_heading_are_checked(self):
+        lines = [line(1, '目录', 40)]
+        for logical in range(1, 6):
+            lines.append(line(1, f'第{logical}章 章节{logical}........{logical}', 80 + logical * 20))
+            lines.append(line(logical + 2, f'第{logical}章 章节{logical}', 90))
+        lines += [line(2, '目录', 40), line(2, '致谢........11', 120),
+                  line(8, '参考文献', 40), line(8, '[1]', 90), line(8, '[2]', 120),
+                  line(12, '致谢', 90)]
+        result = detect_lines(lines, [28])['28']
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(result['findings']), 1)
+        self.assertEqual(result['findings'][0]['page'], 2)
+        self.assertEqual(result['findings'][0]['actual_page'], 10)
+
+
 if __name__ == '__main__':
     unittest.main()

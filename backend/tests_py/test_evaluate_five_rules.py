@@ -55,5 +55,25 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(scored['matched_new_findings'], 1)
         self.assertEqual(scored['other_new_findings'], 1)
 
+
+    def test_formula_site_preserves_dash_separator(self):
+        plan = {'plan': {'page': 34, 'new_marker': '（9-9）'}}
+        self.assertEqual(expected_sites(18, plan), [{'page': 34, 'token': '9-9'}])
+
+
+    def test_baseline_match_tolerates_font_extraction_difference(self):
+        plan = {'plan': {'page': 34, 'new_marker': '（9-9）'}}
+        baseline = {'page': 34, 'token': '2-6', 'bbox': [85, 200, 400, 214],
+                    'text_excerpt': '考代码长度𝑟的关系，如式（2-6）所示：'}
+        unchanged = {'page': 34, 'token': '2-6', 'bbox': [85, 201, 400, 215],
+                     'text_excerpt': '考代码长度r的关系，如式（2-6）所示：'}
+        changed = {'page': 34, 'token': '9-9', 'bbox': [85, 240, 400, 254],
+                   'text_excerpt': '公式如式（9-9）所示：'}
+        scored = score_pair(18, plan, {'status': 'completed', 'findings': [baseline]},
+                            {'status': 'completed', 'findings': [unchanged, changed]})
+        self.assertEqual(scored['new_findings'], 1)
+        self.assertEqual(scored['other_new_findings'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()

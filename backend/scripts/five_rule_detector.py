@@ -105,22 +105,34 @@ def _toc_pages(lines: list[Line], page_count: int) -> set[int]:
         by_page[row.page].append(row.text)
     pages = set()
     max_candidate = min(60, max(2, int(page_count * .5)))
+    headings_by_page = {}
     for page, texts in by_page.items():
         if page > max_candidate:
             continue
         entries = [_TOC_ENTRY.match(text) for text in texts]
         headings = [match.group(1).strip() for match in entries if match]
+        headings_by_page[page] = headings
         chapter_like = sum(bool(re.match(r'^(?:第\s*(?:\d+|[一二三四五六七八九十]+)\s*章|\d+(?:[.．]\d+)*\s+)', text)) for text in headings)
         if len(headings) >= 3 and chapter_like >= 2:
             pages.add(page)
+    if pages:
+        for direction, boundary in ((-1, min(pages)), (1, max(pages))):
+            page = boundary + direction
+            while 1 <= page <= max_candidate:
+                headings = headings_by_page.get(page, [])
+                if not headings or all(re.match(r'^[图表]\s*\d', text) for text in headings):
+                    break
+                pages.add(page)
+                page += direction
     return pages
 
 
 def _body_start(lines: list[Line], toc_pages: set[int]) -> int:
+    after_toc = max(toc_pages, default=0)
     for line in lines:
-        if line.page not in toc_pages and _CHAPTER.match(line.text.strip()):
+        if line.page > after_toc and _CHAPTER.match(line.text.strip()):
             return line.page
-    return max(toc_pages, default=0) + 1
+    return after_toc + 1
 
 
 def _reference_start(lines: list[Line], body_start: int, page_count: int) -> int | None:
@@ -265,7 +277,7 @@ def _heading_candidates(body: list[Line]) -> dict[str, int]:
                 if len(seq) != width or any(seq[j].bbox[1] - seq[j - 1].bbox[1] > 45 for j in range(1, len(seq))):
                     break
                 key = _compact(''.join(item.text for item in seq))
-                if 3 <= len(key) <= 110 and key not in candidates:
+                if 2 <= len(key) <= 110 and key not in candidates:
                     candidates[key] = page
     return candidates
 
@@ -276,7 +288,7 @@ def _rule_28(lines: list[Line], toc_pages: set[int], body: list[Line]) -> dict:
         match = _TOC_ENTRY.match(line.text)
         if match:
             heading = _compact(match.group(1))
-            if len(heading) >= 3:
+            if len(heading) >= 2:
                 entries.append((heading, int(match.group(2)), line))
     if len(entries) < 5:
         return _result(reason='未可靠识别至少五条目录页码')
@@ -284,7 +296,7 @@ def _rule_28(lines: list[Line], toc_pages: set[int], body: list[Line]) -> dict:
     matches = []
     for heading, shown, line in entries:
         pages = [page for key, page in headings.items() if key == heading or
-                 (key.startswith(heading) and len(key) - len(heading) <= 12)]
+                 (len(heading) >= 4 and key.startswith(heading) and len(key) - len(heading) <= 12)]
         if pages:
             matches.append((shown, min(pages), line))
     if len(matches) < 5:
@@ -327,7 +339,9 @@ def detect_lines(lines: list[Line], selected_rules=RULES, page_count: int | None
         if 24 in selected:
             results['24'] = r24
     if 28 in selected:
-        results['28'] = _rule_28(ordered, toc_pages, body)
+        toc_body = [line for line in ordered if line.page > max(toc_pages, default=0)
+                    and line.page not in toc_pages]
+        results['28'] = _rule_28(ordered, toc_pages, toc_body)
     return results
 
 

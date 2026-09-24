@@ -9,7 +9,6 @@ import argparse
 import json
 import re
 import time
-from collections import Counter
 from pathlib import Path
 
 from five_rule_detector import RULES, detect_pdf
@@ -26,7 +25,9 @@ def expected_sites(rule: int, mutation_plan: dict) -> list[dict]:
         return [{'page': int(plan.get('abstract_page', changes[0]['page'])),
                  'text': changes[0]['new_text']}] if changes else []
     if rule in (18, 22):
-        return [{'page': int(plan['page']), 'token': re.sub(r'[^\d.]', '', plan['new_marker'])}]
+        marker = plan['new_marker'].replace('．', '.').replace('－', '-')
+        allowed = r'[^\d.\-]' if rule == 18 else r'\D'
+        return [{'page': int(plan['page']), 'token': re.sub(allowed, '', marker)}]
     if rule == 24:
         return [{'page': int(plan['target_page']), 'token': re.sub(r'\D', '', plan['new_marker'])}]
     if rule == 28:
@@ -48,9 +49,13 @@ def _matches(rule: int, site: dict, finding: dict) -> bool:
     return True
 
 
-def _fingerprint(finding: dict) -> tuple:
-    return (finding.get('page'), str(finding.get('token', '')),
-            _clean(finding.get('text_excerpt', ''))[:90])
+def _same_finding(left: dict, right: dict) -> bool:
+    if left.get('page') != right.get('page') or str(left.get('token', '')) != str(right.get('token', '')):
+        return False
+    left_box, right_box = left.get('bbox', []), right.get('bbox', [])
+    if len(left_box) >= 2 and len(right_box) >= 2:
+        return abs(left_box[1] - right_box[1]) <= 12 and abs(left_box[0] - right_box[0]) <= 50
+    return _clean(left.get('text_excerpt', '')) == _clean(right.get('text_excerpt', ''))
 
 
 def _unique_matches(rule: int, sites: list[dict], findings: list[dict]) -> int:
@@ -69,14 +74,15 @@ def score_pair(rule: int, mutation_plan: dict, mother: dict, mutant: dict) -> di
     sites = expected_sites(rule, mutation_plan)
     baseline = mother.get('findings', []) if mother.get('status') == 'completed' else []
     found = mutant.get('findings', []) if mutant.get('status') == 'completed' else []
-    baseline_counter = Counter(_fingerprint(f) for f in baseline)
+    unmatched_baseline = list(baseline)
     new_findings = []
     for finding in found:
-        fingerprint = _fingerprint(finding)
-        if baseline_counter[fingerprint]:
-            baseline_counter[fingerprint] -= 1
-        else:
+        match_index = next((i for i, prior in enumerate(unmatched_baseline)
+                            if _same_finding(prior, finding)), None)
+        if match_index is None:
             new_findings.append(finding)
+        else:
+            unmatched_baseline.pop(match_index)
     detected = _unique_matches(rule, sites, found)
     matched_new = _unique_matches(rule, sites, new_findings)
     return {'expected_sites': len(sites), 'detected_sites': detected,
