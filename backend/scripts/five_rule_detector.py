@@ -11,15 +11,16 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 
 import pymupdf
 
 RULES = (6, 18, 22, 24, 28)
 TITLES = {6: '摘要连续内容重复', 18: '公式引用目标不存在', 22: '文献引用目标不存在',
           24: '参考文献未被正文引用', 28: '目录页码与正文不一致'}
-_CITATION = re.compile(r'\[(\d+(?:\s*[-–,，、]\s*\d+)*)\]')
-_FORMULA_REFERENCE = re.compile(r'(?:公式|(?<!公)式|equation|eq\.?)[\s:：]*[（(]\s*(\d+(?:\s*[.．-]\s*\d+)+)\s*[)）]', re.I)
-_DISPLAY_FORMULA = re.compile(r'^[（(]\s*(\d+(?:\s*[.．-]\s*\d+)+)\s*[)）]$')
+_CITATION = re.compile(r'\[(\d+(?:\s*[-–—－,，、;；]\s*\d+)*)\]')
+_FORMULA_REFERENCE = re.compile(r'(?:公式|(?<!公)式|equation|eq\.?)[\s:：]*[（(]\s*(\d+(?:\s*[.．–—－-]\s*\d+)+)\s*[)）]', re.I)
+_DISPLAY_FORMULA = re.compile(r'^[（(]\s*(\d+(?:\s*[.．–—－-]\s*\d+)+)\s*[)）]$')
 _TOC_ENTRY = re.compile(r'^\s*(.+?)(?:(?:\.\s*){2,}|…{2,}|⋯{2,}|·{2,})\s*(\d{1,4})\s*$')
 _REF_LABEL = re.compile(r'^\s*\[(\d+)\]')
 _CHAPTER = re.compile(r'^(?:第\s*(?:\d+|[一二三四五六七八九十]+)\s*章|1[\s.．]+[^0-9]|introduction|引言|绪论)', re.I)
@@ -196,12 +197,16 @@ def _rule_6(abstract: list[Line], body: list[Line]) -> dict:
     return _result(findings)
 
 
+def _formula_key(number: str) -> str:
+    return re.sub(r'\s+', '', number).translate(str.maketrans({'．': '.', '-': '.', '–': '.', '—': '.', '－': '.'}))
+
+
 def _rule_18(body: list[Line]) -> dict:
     displayed = set()
     for line in body:
         marker = _DISPLAY_FORMULA.match(line.text.strip())
         if marker and (line.bbox[0] > line.page_width * .55 or len(line.text.strip()) < 20):
-            displayed.add(re.sub(r'\s+', '', marker.group(1)).replace('．', '.'))
+            displayed.add(_formula_key(marker.group(1)))
     if not displayed:
         return _result(reason='未可靠识别独立公式编号')
     findings = []
@@ -210,7 +215,7 @@ def _rule_18(body: list[Line]) -> dict:
         for match in _FORMULA_REFERENCE.finditer(line.text):
             number = re.sub(r'\s+', '', match.group(1)).replace('．', '.')
             key = (line.page, number, line.bbox[1])
-            if number not in displayed and key not in seen:
+            if _formula_key(number) not in displayed and key not in seen:
                 findings.append(_finding(18, line, f'公式引用 {number} 在公式编号中不存在', token=number))
                 seen.add(key)
     return _result(findings)
@@ -231,15 +236,38 @@ def _references(lines: list[Line], ref_start: int | None) -> list[tuple[int, Lin
     return entries
 
 
+def _is_array_index(text: str, match: re.Match[str]) -> bool:
+    if not match.group(1).isdigit():
+        return False
+    before = text[max(0, match.start() - 32):match.start()]
+    after = text[match.end():match.end() + 8]
+    if re.search(r'=\s*$', before) or re.match(r'\s*=', after):
+        return True
+    return bool(re.search(r'=\s*\w+\s*$', before))
+
+
 def _citation_numbers(text: str) -> list[tuple[int, str]]:
     found = []
     for match in _CITATION.finditer(text):
-        inner = match.group(1)
-        numbers = [int(s) for s in re.findall(r'\d+', inner)]
-        if len(numbers) > 1 and (0 in numbers or max(numbers) - min(numbers) > 50):
+        if _is_array_index(text, match):
             continue
-        if len(numbers) == 2 and re.search(r'[-–]', inner) and numbers[1] - numbers[0] in range(1, 51):
-            numbers = list(range(numbers[0], numbers[1] + 1))
+        numbers = []
+        for part in re.split(r'[,，、;；]', match.group(1)):
+            interval = re.fullmatch(r'\s*(\d+)\s*[-–—－]\s*(\d+)\s*', part)
+            if interval:
+                first, last = map(int, interval.groups())
+                if last < first or last - first > 50:
+                    numbers = []
+                    break
+                numbers.extend(range(first, last + 1))
+            elif re.fullmatch(r'\s*\d+\s*', part):
+                numbers.append(int(part.strip()))
+            else:
+                numbers = []
+                break
+        # A bracketed numeric interval such as [0,500] is not a citation.
+        if len(numbers) > 1 and 0 in numbers:
+            continue
         found.extend((number, match.group(0)) for number in numbers)
     return found
 
@@ -269,6 +297,7 @@ def _heading_candidates(body: list[Line]) -> dict[str, int]:
         by_page[line.page].append(line)
     candidates = {}
     for page, page_lines in by_page.items():
+        typical_height = median(item.bbox[3] - item.bbox[1] for item in page_lines)
         for i, line in enumerate(page_lines):
             if line.bbox[1] > line.page_height * .9:
                 continue
@@ -276,6 +305,11 @@ def _heading_candidates(body: list[Line]) -> dict[str, int]:
                 seq = page_lines[i:i + width]
                 if len(seq) != width or any(seq[j].bbox[1] - seq[j - 1].bbox[1] > 45 for j in range(1, len(seq))):
                     break
+                chapter_like = re.match(r'^\s*(?:第\s*[\d一二三四五六七八九十]+\s*章|\d+\s+)', line.text)
+                if chapter_like and line.bbox[1] > line.page_height * .28:
+                    title_height = max(item.bbox[3] - item.bbox[1] for item in seq)
+                    if title_height < typical_height * 1.2:
+                        continue
                 key = _compact(''.join(item.text for item in seq))
                 if 2 <= len(key) <= 110 and key not in candidates:
                     candidates[key] = page
@@ -295,8 +329,10 @@ def _rule_28(lines: list[Line], toc_pages: set[int], body: list[Line]) -> dict:
     headings = _heading_candidates(body)
     matches = []
     for heading, shown, line in entries:
-        pages = [page for key, page in headings.items() if key == heading or
-                 (len(heading) >= 4 and key.startswith(heading) and len(key) - len(heading) <= 12)]
+        pages = [page for key, page in headings.items() if key == heading]
+        if not pages:
+            pages = [page for key, page in headings.items() if len(heading) >= 4
+                     and key.startswith(heading) and len(key) - len(heading) <= 12]
         if pages:
             matches.append((shown, min(pages), line))
     if len(matches) < 5:
