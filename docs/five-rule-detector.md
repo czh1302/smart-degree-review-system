@@ -19,6 +19,8 @@ python backend/scripts/five_rule_detector.py --pdf C:\path\to\paper.pdf --rule 2
 - 规则 18：正文公式引用编号找不到可见的独立公式编号。
 - 规则 22：全文（参考文献表自身除外）的文献引用编号找不到对应参考文献；表格数值标注等非引文不计。
 - 规则 24：编号参考文献在全文（参考文献表自身除外，包括附录、图题和表题）均未被引用。
+
+规则 24 将字号可确认为上标的 `[28 29]` 识别为两个引用；若参考文献表后的附录标题在 PDF 提取中缺失，则结合最后一条编号参考文献与后续编号小节识别结束边界。普通字号的数字数组不会按这种空格分隔方式计为引文。
 - 规则 28：目录标题与正文标题匹配后，以多数标题推算页码偏移，再报告异常目录页码。
 
 检测器按位置返回 `findings`：同一规则在一篇 PDF 中有多处问题时，分别给出页码和行坐标。规则 18、22 对同一行内重复出现的错误引用也分别报告，并用 `text_range=[起始字符位置, 结束字符位置]` 区分；规则 6 只将重叠的三行匹配窗口合并为同一重复段。规则 24 逐条报告未引用文献，规则 28 逐条报告已匹配目录项的页码错误。
@@ -42,6 +44,6 @@ python backend/scripts/evaluate_five_rules.py --manifest ..\output\source_route_
 
 按“规则 × 配对 PDF”计数：TP=违规且检出，FN=违规却未检出，FP=合规却报违规，TN=合规且未报。每规则 `TP+FP+TN+FN=200`，五规则合计 1000。Recall=`TP/(TP+FN)`，Precision=`TP/(TP+FP)`。解析失败或 `unsupported` 单列，不得默认为 TN。
 
-修复后的检测器已重新完成 500 对配对注入样本评估：TP=500、FP=0、TN=500、FN=0，900 个预设变异位置全部命中；结果仅适用于该受控样本，见工作区 `output/five_rule_detection/paired_fulltext_recheck_v17/summary.json`。规则 22、24 的 479 篇自然论文复核见 `output/five_rule_detection/archive_audit/recheck_2026-09-25.md`；旧归档标签已撤回，尚不能计算自然论文的最终混淆矩阵。
+修复后的检测器已重新完成 500 对配对注入样本评估：TP=500、FP=0、TN=500、FN=0，900 个预设变异位置全部命中；结果仅适用于该受控样本，见工作区 `output/five_rule_detection/paired_fulltext_recheck_v18/summary.json`。规则 22、24 的 479 篇自然论文复核见 `output/five_rule_detection/archive_audit/recheck_2026-09-25.md`；旧归档标签已撤回，尚不能计算自然论文的最终混淆矩阵。
 
 工作区当前数据入口见 `output/CURRENT.md`。被替换的中间扫描在 `output/_archive/superseded-2026-09-25/`；旧 `FINAL_REPORT.md` 留在原位并已标记撤回。

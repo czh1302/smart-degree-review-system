@@ -17,8 +17,8 @@ import pymupdf
 
 RULES = (6, 18, 22, 24, 28)
 TITLES = {6: '摘要连续内容重复', 18: '公式引用目标不存在', 22: '文献引用目标不存在',
-          24: '参考文献未被正文引用', 28: '目录页码与正文不一致'}
-_CITATION = re.compile(r'\[(\d+(?:\s*[-–—－,，、;；]\s*\d+)*)\]')
+          24: '参考文献未被全文引用', 28: '目录页码与正文不一致'}
+_CITATION = re.compile(r'\[(\d+(?:(?:\s*[-–—－,，、;；]\s*|\s+)\d+)*)\]')
 _FORMULA_REFERENCE = re.compile(r'(?:公式|(?<!公)式|equation|eq\.?)[\s:：]*[（(]\s*(\d+(?:\s*[.．–—－−-]\s*\d+)+[a-z]?)\s*[)）]', re.I)
 _DISPLAY_FORMULA = re.compile(r'^[（(]\s*(\d+(?:\s*[.．–—－−-]\s*\d+)+[a-z]?)\s*[)）]$', re.I)
 _DISPLAY_FORMULA_TAIL = re.compile(r'[（(]\s*(\d+(?:\s*[.．–—－−-]\s*\d+)+[a-z]?)\s*[)）]\s*$', re.I)
@@ -291,7 +291,7 @@ def _rule_18(body: list[Line]) -> dict:
 
 
 def _reference_bounds(lines: list[Line], ref_start: int | None) -> tuple[int, int]:
-    """Return the actual bibliography line range, leaving appendices in citation scope."""
+    """Return only the bibliography, preserving every later section for citations."""
     if ref_start is None:
         return len(lines), len(lines)
     start = next((i for i, line in enumerate(lines)
@@ -301,8 +301,28 @@ def _reference_bounds(lines: list[Line], ref_start: int | None) -> tuple[int, in
     end = next((i for i in range(start + 1, len(lines))
                 if re.match(r'^(?:致谢|附录|acknowledg(?:e)?ments?|appendix|学术论文和科研成果|学术论文|科研成果|研究成果|research(?:outputs?|achievements?)|攻读.{0,20}(?:期间|发表)|作者简介|个人简历)',
                             _heading(lines[i].text), re.I)), len(lines))
+    # Some converted PDFs retain a "参考文献" running header on appendix pages
+    # and lose the appendix label, leaving only a numbered subsection such as
+    # ".1 核函数". The first new subsection after the final numbered reference
+    # marks the end of the bibliography; the entire page returns to citation scope.
+    label_indexes = [i for i in range(start + 1, end) if _REF_LABEL.match(lines[i].text)]
+    if label_indexes:
+        last_label_page = lines[label_indexes[-1]].page
+        for i in range(label_indexes[-1] + 1, end):
+            line = lines[i]
+            if line.page <= last_label_page or line.bbox[1] > line.page_height * .35:
+                continue
+            heading = _heading(line.text).replace('．', '.')
+            if not re.fullmatch(r'(?:\.\d+|[a-z]\.?(?:\d+)(?:\.\d+)*|\d+\.\d+(?:\.\d+)*)', heading, re.I):
+                continue
+            following = [item for item in lines[i + 1:end] if item.page == line.page][:5]
+            if len(following) < 2 or not any(len(item.text.strip()) >= 10 for item in following):
+                continue
+            if any(_REF_LABEL.match(item.text) for item in following):
+                continue
+            end = next(j for j in range(start + 1, i + 1) if lines[j].page == line.page)
+            break
     return start, end
-
 
 def _references(lines: list[Line], ref_start: int | None) -> list[tuple[int, Line]]:
     if ref_start is None:
@@ -455,7 +475,16 @@ def _citation_numbers(line: Line, max_ref: int, citation_style: float | None) ->
         if _is_array_index(text, match):
             continue
         numbers = []
-        for part in re.split(r'[,，、;；]', match.group(1)):
+        raw_numbers = match.group(1)
+        space_separated = bool(re.fullmatch(r'\d+(?:\s+\d+)+', raw_numbers))
+        if space_separated:
+            # PDF extraction may omit separators between superscript references.
+            # Ordinary brackets such as vector shapes remain data.
+            ratio = _marker_size_ratio(line, match)
+            if ratio is None or ratio >= .82:
+                continue
+        parts = re.split(r'\s+' if space_separated else r'[,，、;；]', raw_numbers)
+        for part in parts:
             interval = re.fullmatch(r'\s*(\d+)\s*[-–—－]\s*(\d+)\s*', part)
             if interval:
                 first, last = map(int, interval.groups())
@@ -557,7 +586,7 @@ def _rules_22_24(body: list[Line], entries: list[tuple[int, Line]]) -> tuple[dic
                 finding['text_excerpt'] = ' '.join(part.text for part in parts)[:220]
                 finding['location']['text_excerpt'] = finding['text_excerpt']
             missing_targets.append(finding)
-    uncited = [_finding(24, line, f'参考文献 [{number}] 未在正文引用', token=str(number))
+    uncited = [_finding(24, line, f'参考文献 [{number}] 未在全文引用', token=str(number))
                for number, line in entries if number not in citations]
     return _result(missing_targets), _result(uncited)
 

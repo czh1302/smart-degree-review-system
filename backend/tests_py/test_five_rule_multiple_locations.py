@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from five_rule_detector import Line, detect_lines, _rule_6
+from five_rule_detector import Line, detect_lines, _citation_numbers, _rule_6
 
 
 def line(page, text, y=100, x0=60):
@@ -270,6 +270,36 @@ class MultipleViolationLocationsTests(unittest.TestCase):
         result = detect_lines(lines, [24])['24']
         self.assertEqual(result['findings'], [])
 
+    def test_rule_24_counts_superscript_space_separated_citations(self):
+        text = 'Prov-GigaPath[28 29]参与比较。'
+        marker_start = text.index('[28 29]')
+        body = Line(1, text, (60, 100, 540, 112), 600, 800,
+                    ((0, marker_start, 12),
+                     (marker_start, marker_start + len('[28 29]'), 7.8),
+                     (marker_start + len('[28 29]'), len(text), 12)))
+        lines = [line(1, '第1章 方法', 50), body,
+                 line(2, '参考文献', 40),
+                 line(2, '[28] 文献甲', 80),
+                 line(2, '[29] 文献乙', 100),
+                 line(2, '[30] 未引用文献', 120)]
+        findings = detect_lines(lines, [24])['24']['findings']
+        self.assertEqual([item['token'] for item in findings], ['30'])
+
+    def test_plain_size_space_separated_numbers_are_not_citations(self):
+        self.assertEqual(_citation_numbers(line(1, 'shape [256 128]'), 300, None), [])
+
+    def test_rule_24_includes_prose_after_last_reference_without_appendix_heading(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80),
+                 line(2, '[2] 文献乙', 100),
+                 line(3, '参考文献', 40),  # stale running page header
+                 line(3, '.1', 100),
+                 line(3, '核函数', 125),
+                 line(3, '实验使用MuJoCo[2]渲染数据集。', 170),
+                 line(4, '学术论文和科研成果目录', 40)]
+        findings = detect_lines(lines, [24])['24']['findings']
+        self.assertEqual([item['token'] for item in findings], ['1'])
     def test_rule_24_counts_citations_after_research_outputs_heading(self):
         lines = [line(1, '第1章 方法', 50),
                  line(2, '参考文献', 40),
