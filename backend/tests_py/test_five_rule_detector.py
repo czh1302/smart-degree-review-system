@@ -74,8 +74,8 @@ class FiveRuleDetectorTests(unittest.TestCase):
 
     def test_numeric_interval_is_not_a_bibliographic_citation(self):
         lines = [line(1, '第1章 绪论'), line(1, '取值范围为[0, 500]，已有研究[1]。', 140),
-                 line(2, '参考文献', 40), line(2, '[1]', 100),
-                 line(2, '[2]', 140)]
+                 line(2, '参考文献', 40), line(2, '[1] Wang. First paper.', 100),
+                 line(2, '[2] Li. Second paper.', 140)]
         result = detect_lines(lines, [22])['22']
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['findings'], [])
@@ -112,7 +112,8 @@ class FiveRuleDetectorTests(unittest.TestCase):
                  line(2, '图1.2 分析结果[1]........5', 100),
                  line(2, '图1.3 系统架构[1]........6', 120),
                  line(3, '第1章 绪论', 40),
-                 line(4, '参考文献', 40), line(4, '[1]', 80), line(4, '[2]', 100)]
+                 line(4, '参考文献', 40), line(4, '[1] Wang. First paper.', 80),
+                 line(4, '[2] Li. Second paper.', 100)]
         result = detect_lines(lines, [22])['22']
         self.assertEqual(result['status'], 'completed')
         self.assertEqual([f['token'] for f in result['findings']], ['99'])

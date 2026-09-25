@@ -143,6 +143,55 @@ class MultipleViolationLocationsTests(unittest.TestCase):
         result = detect_lines(lines, [22])['22']
         self.assertEqual(result['findings'], [])
 
+    def test_rule_22_ignores_line_wrapped_hidden_layer_dimensions(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '压缩网络实现为MLP，隐藏层配置为[256,', 120),
+                 line(1, '128]；用于后续实验。', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 100),
+                 line(2, '[300] 文献乙', 130)]
+        result = detect_lines(lines, [22])['22']
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['findings'], [])
+    def test_rule_24_does_not_count_line_wrapped_dimensions_as_references(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '隐藏层配置为[256,', 120),
+                 line(1, '128]；用于压缩网络。', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[128] 第一条文献', 100),
+                 line(2, '[256] 第二条文献', 130)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual([item['token'] for item in result['findings']], ['128', '256'])
+    def test_rule_22_distinguishes_table_numeric_annotations_from_prose_citations(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '0.5734[184]', 120),
+                 line(1, 'MAD-X[524]提出了已有方法。', 150),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 100),
+                 line(2, '[2] 文献乙', 130)]
+        result = detect_lines(lines, [22])['22']
+        self.assertEqual([item['token'] for item in result['findings']], ['524'])
+
+    def test_rule_24_keeps_spaced_table_source_citation(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '0.979 [74]', 120),
+                 line(1, '0.5734[184]', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[74] 表格数据来源', 100),
+                 line(2, '[184] 未引用文献', 130)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual([item['token'] for item in result['findings']], ['184'])
+
+    def test_rule_24_does_not_count_table_numeric_annotation_as_citation(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '0.5734[2]', 120),
+                 line(1, '已有方法[1]。', 150),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 100),
+                 line(2, '[2] 文献乙', 130)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual([item['token'] for item in result['findings']], ['2'])
+
     def test_rule_22_ignores_numeric_data_when_reference_range_is_large(self):
         lines = [line(1, '第1章 方法')]
         data = [r'^(?:9[189]))\d{8}$',
@@ -200,6 +249,112 @@ class MultipleViolationLocationsTests(unittest.TestCase):
                  line(2, '[2026]. https://example.org', 160)]
         result = detect_lines(lines, [24])['24']
         self.assertEqual(result['findings'], [])
+
+    def test_rule_24_counts_reference_range_split_across_pdf_lines(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '已有工作[32-33,', 120),
+                 line(1, '115, 121, 125-127]提出方法。', 140),
+                 line(2, '参考文献', 40)]
+        for index, number in enumerate((32, 33, 115, 121, 125, 126, 127)):
+            lines.append(line(2, f'[{number}] 文献{number}', 80 + index * 20))
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual(result['findings'], [])
+
+    def test_rule_24_counts_appendix_and_caption_citations_after_bibliography(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100),
+                 line(3, '附录 B 实验细节', 40),
+                 line(3, '图 B.1 模型结构参考文献[1]', 100),
+                 line(3, '详细讨论也见[2]。', 140)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual(result['findings'], [])
+
+    def test_rule_24_counts_citations_after_research_outputs_heading(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100),
+                 line(3, '研究成果', 40),
+                 line(3, '补充材料引用文献[1]。', 100)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual([item['token'] for item in result['findings']], ['2'])
+
+    def test_rule_22_locates_citation_split_over_two_pdf_lines(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '已有研究[32-', 120),
+                 line(1, '33]提出方法。', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100)]
+        findings = detect_lines(lines, [22])['22']['findings']
+        self.assertEqual([item['token'] for item in findings], ['32', '33'])
+        for item in findings:
+            selected = item['text_excerpt'][slice(*item['text_range'])]
+            self.assertEqual(selected.replace(' ', ''), '[32-33]')
+            self.assertEqual(len(item['location']['rects']), 2)
+            self.assertEqual(item['location']['rects'][1]['y1'], 140)
+
+    def test_rule_22_ignores_multiple_decimal_table_annotations_in_one_row(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '准确率 0.5734[184] 0.9201[185]', 120),
+                 line(1, 'MAD-X[524]提出方法。', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100)]
+        result = detect_lines(lines, [22])['22']
+        self.assertEqual([item['token'] for item in result['findings']], ['524'])
+
+    def test_rule_22_ignores_one_decimal_annotation_among_table_values(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '准确率 0.5734[184] 0.9201', 120),
+                 line(1, '0.5734[185] 需要追溯。', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100)]
+        result = detect_lines(lines, [22])['22']
+        self.assertEqual([item['token'] for item in result['findings']], ['185'])
+    def test_rule_22_ignores_decimal_table_marks_after_numbered_metric_names(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, 'F1-score 0.5734[184] 0.9201', 120),
+                 line(1, 'Top-1 0.5734[185] 0.9201', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100)]
+        result = detect_lines(lines, [22])['22']
+        self.assertEqual(result['findings'], [])
+    def test_rule_22_ignores_single_decimal_table_metric_with_label(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '准确率 0.5734[184]', 120),
+                 line(1, 'F1 score 0.5734[185] 0.9201', 140),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100)]
+        result = detect_lines(lines, [22])['22']
+        self.assertEqual(result['findings'], [])
+    def test_rule_24_keeps_superscript_source_citation_after_model_version(self):
+        cited = [Line(1, 'GPT-5[95]', (60, 100 + i * 16, 160, 112 + i * 16),
+                      600, 800, ((0, 5, 10.56), (5, 9, 6.96)))
+                 for i in range(5)]
+        target = Line(1, 'Claude Sonnet 4.5[96]', (60, 190, 220, 202),
+                      600, 800, ((0, 17, 10.56), (17, 21, 6.96)))
+        lines = [line(1, '第1章 方法', 50), *cited, target,
+                 line(2, '参考文献', 40),
+                 line(2, '[95] 文献甲', 80), line(2, '[96] 文献乙', 100)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual(result['findings'], [])
+    def test_rule_24_does_not_join_citations_across_pdf_columns(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '引用[1,', 500, 60),
+                 line(1, '2] 表中参数', 30, 330),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual([item['token'] for item in result['findings']], ['1', '2'])
+    def test_rule_24_does_not_treat_academic_output_list_number_as_citation(self):
+        lines = [line(1, '第1章 方法', 50),
+                 line(1, '已有方法[2]。', 120),
+                 line(2, '参考文献', 40),
+                 line(2, '[1] 文献甲', 80), line(2, '[2] 文献乙', 100),
+                 line(3, '学术论文和科研成果目录', 40),
+                 line(3, '专利', 75),
+                 line(3, '[1] 第二发明人，某专利', 100)]
+        result = detect_lines(lines, [24])['24']
+        self.assertEqual([item['token'] for item in result['findings']], ['1'])
 
     def test_rule_24_reports_each_uncited_reference_entry(self):
         lines = [line(1, '第1章 绪论'), line(1, '已有研究[1]指出该问题', 140),
@@ -447,5 +602,19 @@ class MultipleViolationLocationsTests(unittest.TestCase):
         self.assertEqual([item['token'] for item in result['findings']], ['8-11'])
 
 
+    def test_rule_24_marks_empty_reference_list_unsupported_but_keeps_split_entries(self):
+        blank = [line(1, '第1章 方法', 50), line(1, '参见已有研究[1]。', 100),
+                 line(2, '参考文献', 40), line(2, '[1]', 100), line(2, '.', 115),
+                 line(2, '[2]', 130), line(2, '.', 145),
+                 line(2, '[3]', 160), line(2, '.', 175),
+                 line(2, '上海交通大学博士学位论文', 190)]
+        self.assertEqual(detect_lines(blank, [24])['24']['status'], 'unsupported')
+        valid = [line(1, '第1章 方法', 50), line(1, '参见已有研究[1]。', 100),
+                 line(2, '参考文献', 40), line(2, '[1]', 100),
+                 line(2, 'Smith. First paper. Journal, 2024.', 115),
+                 line(2, '[2]', 130), line(2, 'Jones. Second paper. Journal, 2025.', 145)]
+        result = detect_lines(valid, [24])['24']
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual([item['token'] for item in result['findings']], ['2'])
 if __name__ == '__main__':
     unittest.main()

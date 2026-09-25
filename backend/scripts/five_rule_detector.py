@@ -290,15 +290,27 @@ def _rule_18(body: list[Line]) -> dict:
     return _result(findings)
 
 
+def _reference_bounds(lines: list[Line], ref_start: int | None) -> tuple[int, int]:
+    """Return the actual bibliography line range, leaving appendices in citation scope."""
+    if ref_start is None:
+        return len(lines), len(lines)
+    start = next((i for i, line in enumerate(lines)
+                  if line.page == ref_start
+                  and _heading(line.text) in {'参考文献', 'references', 'bibliography'}),
+                 next((i for i, line in enumerate(lines) if line.page >= ref_start), len(lines)))
+    end = next((i for i in range(start + 1, len(lines))
+                if re.match(r'^(?:致谢|附录|acknowledg(?:e)?ments?|appendix|学术论文和科研成果|学术论文|科研成果|研究成果|research(?:outputs?|achievements?)|攻读.{0,20}(?:期间|发表)|作者简介|个人简历)',
+                            _heading(lines[i].text), re.I)), len(lines))
+    return start, end
+
+
 def _references(lines: list[Line], ref_start: int | None) -> list[tuple[int, Line]]:
     if ref_start is None:
         return []
     entries = []
-    for line in lines:
-        if line.page < ref_start:
-            continue
-        if _heading(line.text) in {'致谢', '附录', 'acknowledgements', 'appendix'}:
-            break
+    start, end = _reference_bounds(lines, ref_start)
+    reference_lines = lines[start + 1:end]
+    for line in reference_lines:
         match = _REF_LABEL.match(line.text)
         if match:
             number = int(match.group(1))
@@ -306,8 +318,22 @@ def _references(lines: list[Line], ref_start: int | None) -> list[tuple[int, Lin
             if 1900 <= number <= 2099 and re.match(r'\s*[.)）]\s*https?://', tail, re.I):
                 continue
             entries.append((number, line))
-    return entries
+    # PDF extraction can leave only numbered placeholders and punctuation. In
+    # that case the bibliography itself is unreadable, so an uncited-reference
+    # verdict would be unjustified. Labels may be on separate lines from real
+    # entries, so inspect the entire reference section rather than label tails.
+    def meaningful(line: Line) -> bool:
+        text = _REF_LABEL.sub('', line.text, count=1).strip()
+        heading = _heading(text)
+        if heading in {'参考文献', 'references', 'bibliography'}:
+            return False
+        if re.fullmatch(r'[^\W\d_]{2,}大学.*学位论文', heading):
+            return False  # running university header
+        return bool(re.search(r'[A-Za-z]{2,}|[\u4e00-\u9fff]', text))
 
+    if entries and not any(meaningful(line) for line in reference_lines):
+        return []
+    return entries
 
 def _is_array_index(text: str, match: re.Match[str]) -> bool:
     if not match.group(1).isdigit():
@@ -319,10 +345,22 @@ def _is_array_index(text: str, match: re.Match[str]) -> bool:
     return bool(re.search(r'=\s*\w+\s*$', before))
 
 
-def _numeric_bracket_is_data(text: str, match: re.Match[str], numbers: list[int], max_ref: int) -> bool:
+def _numeric_bracket_is_data(text: str, match: re.Match[str], numbers: list[int], max_ref: int,
+                             marker_ratio: float | None, citation_style: float | None) -> bool:
     """Reject common numeric arrays, years and subscripts before citation lookup."""
     before = text[max(0, match.start() - 45):match.start()]
     after = text[match.end():match.end() + 12]
+    # A short metric row with an attached numeric annotation is table data,
+    # including single cells and labels such as F1-score or Top-1.
+    decimal_marks = list(re.finditer(r'(?<![\w.])[+-]?\d+\.\d+\[\d+\]', text))
+    if (any(item.start() <= match.start() < item.end() for item in decimal_marks)
+            and not (marker_ratio is not None and marker_ratio < .82
+                     and citation_style is not None and citation_style < .82)
+            and re.fullmatch(
+                r'\s*(?:[A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff%+/_ -]{0,14}\s+)?'
+                r'[+-]?\d+\.\d+(?:\[\d+\])?(?:\s+[+-]?\d+\.\d+(?:\[\d+\])?)*\s*',
+                text)):
+        return True
     if not numbers:
         return True
     # Numeric brackets also occur in regular expressions, code, vector shapes,
@@ -346,7 +384,7 @@ def _numeric_bracket_is_data(text: str, match: re.Match[str], numbers: list[int]
         if (len(set(numbers)) < len(numbers)
                 and re.fullmatch(r'\s*\[\d+(?:\s*[,，]\s*\d+)+\]\s*', text)):
             return True
-        if (re.search(r'(?:∈|(?:维数|维度|尺寸|大小|形状)(?:为|是|设为)?|range|size|shape)\s*$', before, re.I)
+        if (re.search(r'(?:∈|(?:维数|维度|尺寸|大小|形状)(?:为|是|设为)?|(?:隐藏层|网络层|神经元)?(?:配置为|设置为|设为)|range|size|shape)\s*$', before, re.I)
                 or re.search(r'\b(?:ranges?|sizes?|dimensions?|intervals?)\b',
                              text[:match.start()], re.I)
                 or re.match(r'\s*(?:range\b|维数|维度|尺寸)', after, re.I)):
@@ -452,11 +490,40 @@ def _citation_numbers(line: Line, max_ref: int, citation_style: float | None) ->
                 if (re.search(r'[A-Z][A-Z0-9_]{1,}$', before)
                         and not re.search(r'(?:提出|采用|模型|方法|研究|技术|等人)[^，。；]{0,18}$', before)):
                     continue
-        if _numeric_bracket_is_data(text, match, numbers, max_ref):
+        if _numeric_bracket_is_data(text, match, numbers, max_ref,
+                                    _marker_size_ratio(line, match), citation_style):
             continue
         found.extend((number, match.group(0), [match.start(), match.end()])
                      for number in numbers)
     return found
+
+
+def _continued_citations(body: list[Line], max_ref: int,
+                         citation_style: float | None):
+    """Recover bracketed citations broken by PDF line wrapping."""
+    opener = re.compile(r'\[\s*\d[\d\s,\uFF0C\u3001;\uFF1B\-\u2013\u2014\uFF0D]*$')
+    for index, first in enumerate(body):
+        if not opener.search(first.text):
+            continue
+        parts = [first]
+        for next_line in body[index + 1:index + 4]:
+            gap = next_line.bbox[1] - parts[-1].bbox[3]
+            if (next_line.page != first.page or not -2 <= gap <= 55
+                    or abs(next_line.bbox[0] - parts[-1].bbox[0]) > 80):
+                break
+            parts.append(next_line)
+            joined = ' '.join(part.text for part in parts)
+            bbox = (min(part.bbox[0] for part in parts),
+                    min(part.bbox[1] for part in parts),
+                    max(part.bbox[2] for part in parts),
+                    max(part.bbox[3] for part in parts))
+            synthetic = Line(first.page, joined, bbox, first.page_width, first.page_height)
+            split = len(first.text)
+            for number, marker, span in _citation_numbers(synthetic, max_ref, citation_style):
+                if span[0] < split < span[1]:
+                    yield first, number, marker, span, tuple(parts)
+            if ']' in next_line.text:
+                break
 
 
 def _rules_22_24(body: list[Line], entries: list[tuple[int, Line]]) -> tuple[dict, dict]:
@@ -467,12 +534,29 @@ def _rules_22_24(body: list[Line], entries: list[tuple[int, Line]]) -> tuple[dic
     citation_style = _body_citation_style(body, labels)
     citations = set()
     missing_targets = []
-    for line in body:
-        for number, marker, text_range in _citation_numbers(line, max(labels), citation_style):
-            citations.add(number)
-            if number not in labels:
-                missing_targets.append(_finding(22, line, f'正文引用 {marker} 无对应参考文献',
-                                                token=str(number), text_range=text_range))
+    occurrences = ((line, number, marker, span, ())
+                   for line in body
+                   for number, marker, span in _citation_numbers(line, max(labels), citation_style))
+    for line, number, marker, text_range, parts in list(occurrences) + list(_continued_citations(body, max(labels), citation_style)):
+        citations.add(number)
+        if number not in labels:
+            finding = _finding(22, line, f'正文引用 {marker} 无对应参考文献',
+                               token=str(number), text_range=text_range)
+            if parts:
+                rects = [_finding(22, part, '')['location']['bounding_rect'] for part in parts]
+                finding['location']['rects'] = rects
+                finding['location']['bounding_rect'] = {
+                    **rects[0],
+                    'x1': min(rect['x1'] for rect in rects),
+                    'y1': min(rect['y1'] for rect in rects),
+                    'x2': max(rect['x2'] for rect in rects),
+                    'y2': max(rect['y2'] for rect in rects),
+                }
+                finding['bbox'] = [finding['location']['bounding_rect'][key]
+                                   for key in ('x1', 'y1', 'x2', 'y2')]
+                finding['text_excerpt'] = ' '.join(part.text for part in parts)[:220]
+                finding['location']['text_excerpt'] = finding['text_excerpt']
+            missing_targets.append(finding)
     uncited = [_finding(24, line, f'参考文献 [{number}] 未在正文引用', token=str(number))
                for number, line in entries if number not in citations]
     return _result(missing_targets), _result(uncited)
@@ -591,8 +675,19 @@ def detect_lines(lines: list[Line], selected_rules=RULES, page_count: int | None
     if 18 in selected:
         results['18'] = _rule_18(body)
     if 22 in selected or 24 in selected:
-        citation_scope = [line for line in ordered if (ref_start is None or line.page < ref_start)
-                          and line.page not in toc_pages]
+        ref_first, ref_last = _reference_bounds(ordered, ref_start)
+        citation_scope = []
+        in_academic_outputs = False
+        for index, line in enumerate(ordered):
+            if index >= ref_last and re.match(
+                    r'^(?:学术论文和科研成果|学术论文|科研成果|研究成果|research(?:outputs?|achievements?)|攻读.{0,20}(?:期间|发表)|作者简介|个人简历)',
+                    _heading(line.text)):
+                in_academic_outputs = True
+            if ref_first <= index < ref_last or line.page in toc_pages:
+                continue
+            if in_academic_outputs and _REF_LABEL.match(line.text):
+                continue  # numbered patents/publications are not literature citations
+            citation_scope.append(line)
         r22, r24 = _rules_22_24(citation_scope, _references(ordered, ref_start))
         if 22 in selected:
             results['22'] = r22
