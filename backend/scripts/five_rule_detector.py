@@ -19,11 +19,13 @@ RULES = (6, 18, 22, 24, 28)
 TITLES = {6: '摘要连续内容重复', 18: '公式引用目标不存在', 22: '文献引用目标不存在',
           24: '参考文献未被正文引用', 28: '目录页码与正文不一致'}
 _CITATION = re.compile(r'\[(\d+(?:\s*[-–—－,，、;；]\s*\d+)*)\]')
-_FORMULA_REFERENCE = re.compile(r'(?:公式|(?<!公)式|equation|eq\.?)[\s:：]*[（(]\s*(\d+(?:\s*[.．–—－-]\s*\d+)+)\s*[)）]', re.I)
-_DISPLAY_FORMULA = re.compile(r'^[（(]\s*(\d+(?:\s*[.．–—－-]\s*\d+)+)\s*[)）]$')
+_FORMULA_REFERENCE = re.compile(r'(?:公式|(?<!公)式|equation|eq\.?)[\s:：]*[（(]\s*(\d+(?:\s*[.．–—－−-]\s*\d+)+[a-z]?)\s*[)）]', re.I)
+_DISPLAY_FORMULA = re.compile(r'^[（(]\s*(\d+(?:\s*[.．–—－−-]\s*\d+)+[a-z]?)\s*[)）]$', re.I)
+_DISPLAY_FORMULA_TAIL = re.compile(r'[（(]\s*(\d+(?:\s*[.．–—－−-]\s*\d+)+[a-z]?)\s*[)）]\s*$', re.I)
 _TOC_ENTRY = re.compile(r'^\s*(.+?)(?:(?:\.\s*){2,}|…{2,}|⋯{2,}|·{2,})\s*(\d{1,4})\s*$')
+_TOC_HEADING = re.compile(r'^(?:第\s*[一二三四五六七八九十\d]+\s*章|[1-9]\d*(?:[.．]\d+)*(?=\s|[\u4e00-\u9fff])|chapter\s+[1-9]\d*|致谢|参考文献|附录|acknowledg(?:e)?ments?|references|bibliography|学术论文|科研成果|研究成果|攻读.{0,20}期间|发表.{0,12}论文|个人简历|作者简介|publications?|research\s+(?:outputs?|achievements?))', re.I)
 _REF_LABEL = re.compile(r'^\s*\[(\d+)\]')
-_CHAPTER = re.compile(r'^(?:第\s*(?:\d+|[一二三四五六七八九十]+)\s*章|1[\s.．]+[^0-9]|introduction|引言|绪论)', re.I)
+_CHAPTER = re.compile(r'^(?:第\s*(?:\d+|[一二三四五六七八九十]+)\s*章|chapter\s+[1-9]\d*|1[\s.．]+[^0-9]|introduction|引言|绪论)', re.I)
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,7 @@ class Line:
     bbox: tuple[float, float, float, float]
     page_width: float
     page_height: float
+    span_sizes: tuple[tuple[int, int, float], ...] = ()
 
 
 def extract_lines(pdf_path: Path) -> tuple[list[Line], int]:
@@ -43,10 +46,20 @@ def extract_lines(pdf_path: Path) -> tuple[list[Line], int]:
                 if block['type'] != 0:
                     continue
                 for raw in block['lines']:
-                    content = ''.join(span['text'] for span in raw['spans']).strip()
+                    untrimmed = ''.join(span['text'] for span in raw['spans'])
+                    content = untrimmed.strip()
                     if content:
+                        left_trim = len(untrimmed) - len(untrimmed.lstrip())
+                        cursor = 0
+                        span_sizes = []
+                        for span in raw['spans']:
+                            start = max(0, cursor - left_trim)
+                            end = min(len(content), cursor + len(span['text']) - left_trim)
+                            if end > start:
+                                span_sizes.append((start, end, float(span['size'])))
+                            cursor += len(span['text'])
                         lines.append(Line(page_number, content, tuple(raw['bbox']),
-                                          page.rect.width, page.rect.height))
+                                          page.rect.width, page.rect.height, tuple(span_sizes)))
         return lines, len(pdf)
 
 
@@ -117,6 +130,13 @@ def _toc_pages(lines: list[Line], page_count: int) -> set[int]:
         if len(headings) >= 3 and chapter_like >= 2:
             pages.add(page)
     if pages:
+        groups = []
+        for page in sorted(pages):
+            if not groups or page > groups[-1][-1] + 1:
+                groups.append([page])
+            else:
+                groups[-1].append(page)
+        pages = set(max(groups, key=lambda group: (len(group), -group[0])))
         for direction, boundary in ((-1, min(pages)), (1, max(pages))):
             page = boundary + direction
             while 1 <= page <= max_candidate:
@@ -182,42 +202,91 @@ def _rule_6(abstract: list[Line], body: list[Line]) -> dict:
         return _result(reason='未可靠识别中文摘要或正文')
     normalized_body = ''.join(_compact(line.text) for line in body)
     findings = []
+    last_matched_end = -1
     for i in range(len(abstract) - 2):
-        chunk = ''.join(_compact(line.text) for line in abstract[i:i + 3])
+        window = abstract[i:i + 3]
+        if any(_compact(line.text).startswith('摘要') or '学位论文' in line.text for line in window):
+            continue
+        chunk = ''.join(_compact(line.text) for line in window)
         if len(chunk) < 55 or chunk not in normalized_body:
             continue
         source = next((line for line in body if len(_compact(line.text)) >= 12
                        and _compact(line.text) in chunk), None)
         if source is None:
             continue
-        if findings and findings[-1]['page'] == abstract[i].page and findings[-1]['related_page'] == source.page:
-            continue
-        findings.append(_finding(6, abstract[i], '摘要中连续三行与正文文字完全重复',
-                                 token=chunk[:30], related_page=source.page))
+        if i > last_matched_end:
+            findings.append(_finding(6, abstract[i], '摘要中连续三行与正文文字完全重复',
+                                     token=chunk[:30], related_page=source.page))
+        last_matched_end = i + 2
     return _result(findings)
 
 
 def _formula_key(number: str) -> str:
-    return re.sub(r'\s+', '', number).translate(str.maketrans({'．': '.', '-': '.', '–': '.', '—': '.', '－': '.'}))
+    return re.sub(r'\s+', '', number).translate(str.maketrans({'．': '.', '-': '.', '–': '.', '—': '.', '－': '.', '−': '.'})).casefold()
+
+
+def _formula_targets(number: str) -> list[str]:
+    compact = re.sub(r'\s+', '', number)
+    interval = re.fullmatch(r'(\d+)[.．−-](\d+)[-–—－−](\d+)[.．−-](\d+)', compact)
+    if interval:
+        first_chapter, first, last_chapter, last = map(int, interval.groups())
+        if first_chapter == last_chapter and first <= last and last - first <= 50:
+            return [f'{first_chapter}.{index}' for index in range(first, last + 1)]
+    return [_formula_key(compact)]
+
+
+def _external_formula_reference(text: str, formula_start: int) -> bool:
+    """Ignore a formula number explicitly attributed to another cited work."""
+    clause = re.split(r'[。！？；;]', text[:formula_start])[-1]
+    attribution = re.search(
+        r'(?:参考)?文献\s*\[[0-9,，\s–—－-]+\]\s*'
+        r'(?:中|所|的|给出|提出)(?:[^。！？；;]{0,30})$', clause)
+    if not attribution:
+        return False
+    return not re.search(r'(?:本文|本研究|本论文|我们)(?:的|中|提出|使用)?$', attribution.group())
 
 
 def _rule_18(body: list[Line]) -> dict:
     displayed = set()
     for line in body:
-        marker = _DISPLAY_FORMULA.match(line.text.strip())
-        if marker and (line.bbox[0] > line.page_width * .55 or len(line.text.strip()) < 20):
+        content = line.text.strip()
+        marker = _DISPLAY_FORMULA.match(content)
+        if marker and (line.bbox[0] > line.page_width * .55 or len(content) < 20):
             displayed.add(_formula_key(marker.group(1)))
+            continue
+        trailing = _DISPLAY_FORMULA_TAIL.search(content)
+        formula_like = line.bbox[0] > line.page_width * .45 or (
+            line.bbox[0] > line.page_width * .25
+            and bool(re.search(r'[=+−×∙∑<>≤≥]', content[:trailing.start()] if trailing else '')))
+        if trailing and formula_like and line.bbox[2] > line.page_width * .7:
+            displayed.add(_formula_key(trailing.group(1)))
     if not displayed:
-        return _result(reason='未可靠识别独立公式编号')
+        if not any(_FORMULA_REFERENCE.search(line.text) for line in body):
+            return _result()
+        return _result(reason='有公式引用，但未可靠识别独立公式编号')
+    displayed_groups = {key[:-1] for key in displayed if key[-1].isalpha()}
     findings = []
-    seen = set()
-    for line in body:
+    for index, line in enumerate(body):
+        context = line.text
+        context_offset = 0
+        if index:
+            previous = body[index - 1]
+            if (previous.page == line.page
+                    and 0 <= line.bbox[1] - previous.bbox[1] <= 35
+                    and abs(line.bbox[0] - previous.bbox[0]) <= 80):
+                context = previous.text + ' ' + line.text
+                context_offset = len(previous.text) + 1
         for match in _FORMULA_REFERENCE.finditer(line.text):
+            if _external_formula_reference(context, context_offset + match.start()):
+                continue
             number = re.sub(r'\s+', '', match.group(1)).replace('．', '.')
-            key = (line.page, number, line.bbox[1])
-            if _formula_key(number) not in displayed and key not in seen:
-                findings.append(_finding(18, line, f'公式引用 {number} 在公式编号中不存在', token=number))
-                seen.add(key)
+            targets = _formula_targets(number)
+            for target in targets:
+                if target in displayed or target in displayed_groups:
+                    continue
+                token = number if len(targets) == 1 else target
+                findings.append(_finding(18, line, f'公式引用 {number} 的目标 {target} 在公式编号中不存在',
+                                         token=token, text_range=[match.start(), match.end()]))
     return _result(findings)
 
 
@@ -232,7 +301,11 @@ def _references(lines: list[Line], ref_start: int | None) -> list[tuple[int, Lin
             break
         match = _REF_LABEL.match(line.text)
         if match:
-            entries.append((int(match.group(1)), line))
+            number = int(match.group(1))
+            tail = line.text[match.end():]
+            if 1900 <= number <= 2099 and re.match(r'\s*[.)）]\s*https?://', tail, re.I):
+                continue
+            entries.append((number, line))
     return entries
 
 
@@ -246,7 +319,99 @@ def _is_array_index(text: str, match: re.Match[str]) -> bool:
     return bool(re.search(r'=\s*\w+\s*$', before))
 
 
-def _citation_numbers(text: str) -> list[tuple[int, str]]:
+def _numeric_bracket_is_data(text: str, match: re.Match[str], numbers: list[int], max_ref: int) -> bool:
+    """Reject common numeric arrays, years and subscripts before citation lookup."""
+    before = text[max(0, match.start() - 45):match.start()]
+    after = text[match.end():match.end() + 12]
+    if not numbers:
+        return True
+    # Numeric brackets also occur in regular expressions, code, vector shapes,
+    # parameter intervals and binary strings.  These are syntax, not citations.
+    if '(?:' in text or r'\d' in text or r'\w' in text:
+        return True
+    if (len(numbers) == 1 and len(match.group(1)) >= 8
+            and set(match.group(1)) <= {'0', '1'}):
+        return True
+    if (re.search(r'\b(?:char|int|float|double|byte)\s+[A-Za-z_]\w*\s*$', before, re.I)
+            and re.match(r'\s*;', after)):
+        return True
+    if (len(numbers) == 1 and not text[:match.start()].strip()
+            and re.match(r'\s*[,，]\s*[^，。]{0,18}=', after)):
+        return True
+    if (len(numbers) > 1 and re.search(r'[-–—－]', match.group(1))
+            and re.search(r'(?:片段|数组|字节|字符|序列|位置|代码|指令)(?:索引|偏移)(?:范围)?\s*$', before)):
+        return True
+    comma_list = any(char in match.group(1) for char in ',，、;；')
+    if len(numbers) > 1 and comma_list:
+        if (len(set(numbers)) < len(numbers)
+                and re.fullmatch(r'\s*\[\d+(?:\s*[,，]\s*\d+)+\]\s*', text)):
+            return True
+        if (re.search(r'(?:∈|(?:维数|维度|尺寸|大小|形状)(?:为|是|设为)?|range|size|shape)\s*$', before, re.I)
+                or re.search(r'\b(?:ranges?|sizes?|dimensions?|intervals?)\b',
+                             text[:match.start()], re.I)
+                or re.match(r'\s*(?:range\b|维数|维度|尺寸)', after, re.I)):
+            return True
+        if (min(numbers) >= 30 and before.endswith(' ')
+                and re.fullmatch(r'\s*[A-Z][A-Z0-9 _-]{1,30}\s*', before)):
+            return True
+    if len(numbers) == 1 and numbers[0] == 0:
+        if re.search(r'(?<![A-Za-z0-9_])(?:[a-z_][A-Za-z_0-9]*|[A-Z])$', before):
+            return True
+        if re.search(r'(?:文献|研究|引用|参见|另见|方法|工作|作者)\s*$', before):
+            return False
+        chinese_before = len(re.findall(r'[\u4e00-\u9fff]', before))
+        prose_prefix = chinese_before or re.search(r'[）】]\s*$', before)
+        if prose_prefix and (re.match(r'\s*[，。；：）】\u4e00-\u9fff]', after)
+                             or (not after.strip() and chinese_before >= 4)):
+            return False
+        return True
+    if (len(numbers) == 1 and numbers[0] > max_ref
+            and re.fullmatch(r'\s*(?:[A-Za-z_][A-Za-z_0-9]*\[\d+\]\s*)+', text)):
+        return True
+    if len(numbers) == 1 and 1900 <= numbers[0] <= 2099 and max_ref < 1900:
+        if re.match(r'\s*年', after) or re.search(r'(?:年|于|发表于|年份|20\d\d)\s*$', before):
+            return True
+        if not re.search(r'(?:文献|研究|引用|参见|另见)\s*$', before):
+            return True
+    if comma_list and len(numbers) > 1 and max(numbers) > max(max_ref * 1.4, max_ref + 30):
+        if not re.search(r'(?:文献|研究|引用|参见|另见)\s*$', before):
+            return True
+    return False
+
+
+def _marker_size_ratio(line: Line, match: re.Match[str]) -> float | None:
+    if not line.span_sizes:
+        return None
+    marker_sizes = []
+    body_sizes = []
+    for start, end, size in line.span_sizes:
+        if start < match.end() and end > match.start():
+            marker_sizes.append(size)
+            if start < match.start() or end > match.end():
+                body_sizes.append(size)
+        else:
+            body_sizes.append(size)
+    if not marker_sizes or not body_sizes:
+        return None
+    return median(marker_sizes) / median(body_sizes)
+
+
+def _body_citation_style(body: list[Line], labels: set[int]) -> float | None:
+    ratios = []
+    for line in body:
+        for match in _CITATION.finditer(line.text):
+            number = match.group(1)
+            if number.isdigit() and int(number) in labels:
+                ratio = _marker_size_ratio(line, match)
+                if ratio is not None:
+                    ratios.append(ratio)
+        if len(ratios) >= 80:
+            break
+    return median(ratios) if len(ratios) >= 5 else None
+
+
+def _citation_numbers(line: Line, max_ref: int, citation_style: float | None) -> list[tuple[int, str, list[int]]]:
+    text = line.text
     found = []
     for match in _CITATION.finditer(text):
         if _is_array_index(text, match):
@@ -268,7 +433,29 @@ def _citation_numbers(text: str) -> list[tuple[int, str]]:
         # A bracketed numeric interval such as [0,500] is not a citation.
         if len(numbers) > 1 and 0 in numbers:
             continue
-        found.extend((number, match.group(0)) for number in numbers)
+        if numbers == [0]:
+            before = text[:match.start()]
+            variable = re.search(r'([A-Za-z_][A-Za-z0-9_]*)$', before)
+            if variable and re.search(
+                    r'(?<![A-Za-z0-9_])' + re.escape(variable.group(1)) + r'\[[1-9]\d*\]',
+                    text[match.end():]):
+                continue  # repeated indices of the same variable, e.g. V[0], V[1]
+            ratio = _marker_size_ratio(line, match)
+            math_line = bool(re.search(r'[=∈∉←⊙∑{}]', text))
+            if ratio is not None and ratio < .82 and not math_line:
+                found.append((0, match.group(0), [match.start(), match.end()]))
+                continue
+            if ratio is not None and ratio >= .92:
+                if citation_style is not None and citation_style < .82:
+                    continue
+                before = text[:match.start()]
+                if (re.search(r'[A-Z][A-Z0-9_]{1,}$', before)
+                        and not re.search(r'(?:提出|采用|模型|方法|研究|技术|等人)[^，。；]{0,18}$', before)):
+                    continue
+        if _numeric_bracket_is_data(text, match, numbers, max_ref):
+            continue
+        found.extend((number, match.group(0), [match.start(), match.end()])
+                     for number in numbers)
     return found
 
 
@@ -277,50 +464,72 @@ def _rules_22_24(body: list[Line], entries: list[tuple[int, Line]]) -> tuple[dic
         reason = '未可靠识别编号参考文献表'
         return _result(reason=reason), _result(reason=reason)
     labels = {number for number, _ in entries}
-    citations = defaultdict(list)
-    for line in body:
-        for number, marker in _citation_numbers(line.text):
-            citations[number].append((line, marker))
+    citation_style = _body_citation_style(body, labels)
+    citations = set()
     missing_targets = []
-    for number, appearances in citations.items():
-        if number not in labels:
-            line, marker = appearances[0]
-            missing_targets.append(_finding(22, line, f'正文引用 {marker} 无对应参考文献', token=str(number)))
+    for line in body:
+        for number, marker, text_range in _citation_numbers(line, max(labels), citation_style):
+            citations.add(number)
+            if number not in labels:
+                missing_targets.append(_finding(22, line, f'正文引用 {marker} 无对应参考文献',
+                                                token=str(number), text_range=text_range))
     uncited = [_finding(24, line, f'参考文献 [{number}] 未在正文引用', token=str(number))
                for number, line in entries if number not in citations]
     return _result(missing_targets), _result(uncited)
 
 
-def _heading_candidates(body: list[Line]) -> dict[str, int]:
+def _heading_candidates(body: list[Line]) -> dict[str, dict[int, float]]:
     by_page = defaultdict(list)
     for line in body:
         by_page[line.page].append(line)
+    normal_heights = [line.bbox[3] - line.bbox[1] for line in body
+                      if line.bbox[1] < line.page_height * .85
+                      and 6 <= line.bbox[3] - line.bbox[1] <= 30]
+    typical_height = median(normal_heights) if normal_heights else 12
     candidates = {}
     for page, page_lines in by_page.items():
-        typical_height = median(item.bbox[3] - item.bbox[1] for item in page_lines)
         for i, line in enumerate(page_lines):
-            if line.bbox[1] > line.page_height * .9:
+            if line.bbox[1] > line.page_height * .9 or re.match(r'^\s*§', line.text):
                 continue
             for width in (1, 2, 3):
                 seq = page_lines[i:i + width]
                 if len(seq) != width or any(seq[j].bbox[1] - seq[j - 1].bbox[1] > 45 for j in range(1, len(seq))):
                     break
+                if any(not _compact(item.text) for item in seq):
+                    continue  # math glyphs or ornament marks cannot extend a heading
                 chapter_like = re.match(r'^\s*(?:第\s*[\d一二三四五六七八九十]+\s*章|\d+\s+)', line.text)
+                title_height = max(item.bbox[3] - item.bbox[1] for item in seq)
+                if title_height > typical_height * 2.5:
+                    continue  # corrupted merged text boxes are not reliable headings
                 if chapter_like and line.bbox[1] > line.page_height * .28:
-                    title_height = max(item.bbox[3] - item.bbox[1] for item in seq)
                     if title_height < typical_height * 1.2:
                         continue
                 key = _compact(''.join(item.text for item in seq))
-                if 2 <= len(key) <= 110 and key not in candidates:
-                    candidates[key] = page
+                if 2 <= len(key) <= 110:
+                    score = title_height / max(typical_height, 1) + (0.25 if chapter_like and line.bbox[1] < line.page_height * .28 else 0)
+                    scores = candidates.setdefault(key, {})
+                    scores[page] = max(scores.get(page, 0), score)
     return candidates
+
+
+def _printed_page_numbers(body: list[Line]) -> dict[int, int]:
+    """Read a standalone page number from the centered bottom margin."""
+    candidates = defaultdict(set)
+    for line in body:
+        text = line.text.strip()
+        if (re.fullmatch(r'\d{1,4}', text)
+                and line.bbox[1] >= line.page_height * .85
+                and line.page_width * .35 <= line.bbox[0] <= line.page_width * .65):
+            candidates[line.page].add(int(text))
+    return {page: next(iter(numbers)) for page, numbers in candidates.items()
+            if len(numbers) == 1}
 
 
 def _rule_28(lines: list[Line], toc_pages: set[int], body: list[Line]) -> dict:
     entries = []
     for line in _visual_rows([item for item in lines if item.page in toc_pages]):
         match = _TOC_ENTRY.match(line.text)
-        if match:
+        if match and _TOC_HEADING.match(match.group(1).strip()):
             heading = _compact(match.group(1))
             if len(heading) >= 2:
                 entries.append((heading, int(match.group(2)), line))
@@ -329,21 +538,36 @@ def _rule_28(lines: list[Line], toc_pages: set[int], body: list[Line]) -> dict:
     headings = _heading_candidates(body)
     matches = []
     for heading, shown, line in entries:
-        pages = [page for key, page in headings.items() if key == heading]
+        pages = dict(headings.get(heading, {}))
         if not pages:
-            pages = [page for key, page in headings.items() if len(heading) >= 4
-                     and key.startswith(heading) and len(key) - len(heading) <= 12]
+            for key, choices in headings.items():
+                if len(heading) >= 4 and key.startswith(heading) and len(key) - len(heading) <= 12:
+                    for page, score in choices.items():
+                        pages[page] = max(pages.get(page, 0), score)
         if pages:
-            matches.append((shown, min(pages), line))
+            best_score = max(pages.values())
+            # A true chapter heading is normally its first strong occurrence;
+            # subsequent running headers repeat the same words on later pages.
+            best_page = min(page for page, score in pages.items()
+                            if score >= best_score * .8)
+            matches.append((shown, best_page, line))
     if len(matches) < 5:
         return _result(reason='目录与正文匹配的标题不足五条')
+    printed = _printed_page_numbers(body)
+    printed_matches = sum(physical in printed for _, physical, _ in matches)
     offsets = Counter(physical - shown for shown, physical, _ in matches)
     offset, support = offsets.most_common(1)[0]
-    if support < max(3, int(len(matches) * .6)):
-        return _result(reason='无法可靠确定目录页码与 PDF 物理页的偏移')
+    offset_reliable = support >= max(3, int(len(matches) * .6))
+    if printed_matches < 5 and not offset_reliable:
+        return _result(reason='未可靠识别正文印刷页码或目录物理页偏移')
     findings = []
     for shown, physical, line in matches:
-        actual = physical - offset
+        if physical in printed:
+            actual = printed[physical]
+        elif offset_reliable:
+            actual = physical - offset
+        else:
+            continue
         if shown != actual:
             findings.append(_finding(28, line, f'目录页码 {shown} 与正文实际页码 {actual} 不一致',
                                      token=str(shown), actual_page=actual, body_pdf_page=physical))
